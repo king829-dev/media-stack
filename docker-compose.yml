@@ -1,0 +1,303 @@
+name: media-stack
+
+# Self-hosted media stack: VPN-routed torrent client, the *arr apps for
+# finding and organising movies/TV/subtitles, Jellyfin to play it all, and
+# a few quality-of-life extras. Every path, user id and secret comes from
+# .env (see .env.example). Everything else is portable as-is.
+#
+# Shared mapping convention: the media pool on the host (MEDIA_ROOT) is
+# mounted at /data in every container that touches media. Keep download,
+# movies and tv folders all under that one mount so Radarr/Sonarr can hard
+# link instead of copying (instant imports, no double disk use).
+
+x-common-env: &common-env
+  PUID: ${PUID:-1000}
+  PGID: ${PGID:-1000}
+  TZ: ${TZ:-America/Chicago}
+
+services:
+  # --- Gluetun (VPN) ---
+  gluetun:
+    # Pinned: the control-server routes go auth-required in versions after
+    # v3.41.x. If you bump, nothing here breaks, but anything you build that
+    # polls http://gluetun:8000 for status will need the auth config.
+    image: qmcgaw/gluetun:v3.41.1
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - 8080:8080 # qBittorrent WebUI (qbittorrent shares this network namespace)
+      - 6881:6881 # Torrent port (TCP)
+      - 6881:6881/udp # Torrent port (UDP)
+    volumes:
+      - ${CONFIG_ROOT}/gluetun:/gluetun
+    environment:
+      # See https://github.com/qdm12/gluetun-wiki for other providers.
+      - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER:-nordvpn}
+      - VPN_TYPE=wireguard
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - SERVER_COUNTRIES=${VPN_SERVER_COUNTRIES:-United States}
+    restart: always
+
+  # --- qBittorrent (routed through the VPN) ---
+  qbittorrent:
+    container_name: qbittorrent
+    image: lscr.io/linuxserver/qbittorrent:latest
+    environment:
+      <<: *common-env
+      WEBUI_PORT: 8080
+    volumes:
+      - ${CONFIG_ROOT}/qbittorrent:/config
+      - ${MEDIA_ROOT}:/data
+      # Optional fast scratch disk for in-progress downloads (SSD). Point
+      # qBittorrent's "incomplete" path at /incomplete, or drop this line.
+      - ${INCOMPLETE_ROOT:-${CONFIG_ROOT}/qbit-incomplete}:/incomplete
+    network_mode: service:gluetun
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        # service_started, not service_healthy: gluetun can take minutes to
+        # pass its healthcheck on a fresh WireGuard handshake, which made
+        # whole-stack redeploys abort with "gluetun is unhealthy" and strand
+        # qbittorrent in Created. qbittorrent is bound to the VPN interface
+        # (see README), so starting before the tunnel is up is leak-safe. It
+        # simply has no traffic until gluetun connects.
+        condition: service_started
+
+  # --- Prowlarr (indexer manager) ---
+  prowlarr:
+    container_name: prowlarr
+    image: lscr.io/linuxserver/prowlarr:latest
+    environment: *common-env
+    volumes:
+      - ${CONFIG_ROOT}/prowlarr:/config
+    ports:
+      - 9696:9696
+    restart: unless-stopped
+
+  # --- FlareSolverr (Cloudflare challenge solver for Prowlarr) ---
+  flaresolverr:
+    container_name: flaresolverr
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ:-America/Chicago}
+    ports:
+      - 8191:8191
+    restart: unless-stopped
+
+  # --- Radarr (movies) ---
+  radarr:
+    container_name: radarr
+    image: lscr.io/linuxserver/radarr:latest
+    environment: *common-env
+    volumes:
+      - ${CONFIG_ROOT}/radarr:/config
+      - ${MEDIA_ROOT}:/data
+    ports:
+      - 7878:7878
+    restart: unless-stopped
+
+  # --- Sonarr (TV) ---
+  sonarr:
+    container_name: sonarr
+    image: lscr.io/linuxserver/sonarr:latest
+    environment: *common-env
+    volumes:
+      - ${CONFIG_ROOT}/sonarr:/config
+      - ${MEDIA_ROOT}:/data
+    ports:
+      - 8989:8989
+    restart: unless-stopped
+
+  # --- Bazarr (subtitles) ---
+  bazarr:
+    container_name: bazarr
+    image: lscr.io/linuxserver/bazarr:latest
+    environment: *common-env
+    volumes:
+      - ${CONFIG_ROOT}/bazarr:/config
+      # must mirror Sonarr/Radarr's /data mapping so library paths line up
+      - ${MEDIA_ROOT}:/data
+    ports:
+      - 6767:6767
+    restart: unless-stopped
+
+  # --- Unpackerr (extracts archived releases so the arrs can import them) ---
+  unpackerr:
+    image: golift/unpackerr
+    container_name: unpackerr
+    environment:
+      <<: *common-env
+      # --- Sonarr ---
+      UN_SONARR_0_URL: http://sonarr:8989
+      UN_SONARR_0_API_KEY: ${SONARR_API_KEY}
+      UN_SONARR_0_PROTOCOLS: torrent
+      UN_SONARR_0_TIMEOUT: 10s
+      UN_SONARR_0_DELETE_ORIG: "true"
+      UN_SONARR_0_DELETE_DELAY: 5m
+      # --- Radarr ---
+      UN_RADARR_0_URL: http://radarr:7878
+      UN_RADARR_0_API_KEY: ${RADARR_API_KEY}
+      UN_RADARR_0_PROTOCOLS: torrent
+      UN_RADARR_0_TIMEOUT: 10s
+      UN_RADARR_0_DELETE_ORIG: "true"
+      UN_RADARR_0_DELETE_DELAY: 5m
+    volumes:
+      - ${MEDIA_ROOT}:/data
+    restart: unless-stopped
+
+  # --- Cleanuparr (download-queue janitor) ---
+  # Handles the fake-release pattern automatically: queue items stuck at
+  # "no files eligible for import" (neutered .exe fakes), stalled downloads
+  # and known malware get blocklisted in the arrs, removed from qBittorrent
+  # and re-searched. Configure via its web UI (:11011).
+  cleanuparr:
+    container_name: cleanuparr
+    image: ghcr.io/cleanuparr/cleanuparr:latest
+    environment:
+      <<: *common-env
+      PORT: 11011
+    volumes:
+      - ${CONFIG_ROOT}/cleanuparr:/config
+    ports:
+      - 11011:11011
+    restart: unless-stopped
+
+  # --- Jellyfin (media server) ---
+  jellyfin:
+    container_name: jellyfin
+    # Pinned: :latest silently jumped 10.x -> 12.0 and broke every client that
+    # used the legacy auth flow. linuxserver publishes no rolling major tag,
+    # so pin the exact build and bump deliberately after checking that your
+    # clients (and Jellyseerr) support it. Tags:
+    # https://github.com/linuxserver/docker-jellyfin/releases
+    image: lscr.io/linuxserver/jellyfin:12.0ubu2604-ls48
+    environment: *common-env
+    volumes:
+      - ${CONFIG_ROOT}/jellyfin:/config
+      - ${MEDIA_ROOT}:/data
+      # Transcode scratch on a fast disk (SSD, or tmpfs below). Optional.
+      - ${TRANSCODE_ROOT:-${CONFIG_ROOT}/jellyfin-transcodes}:/transcodes
+    ports:
+      - 8096:8096
+    # Hardware transcoding (Intel QuickSync / AMD VAAPI). Remove on hosts
+    # without /dev/dri, such as a Raspberry Pi 5 where it buys nothing.
+    devices:
+      - /dev/dri:/dev/dri
+    tmpfs:
+      - /transcode:size=3G
+    restart: unless-stopped
+
+  # --- Jellyseerr / Seerr (requests) ---
+  jellyseerr:
+    container_name: jellyseerr
+    # Jellyseerr was renamed to Seerr; 3.x speaks Jellyfin 12's non-legacy
+    # auth (the old 2.x images 400 on login). Runs as uid 1000, so the config
+    # dir must be owned by PUID:PGID, and it needs init: true.
+    image: ghcr.io/seerr-team/seerr:latest
+    init: true
+    environment:
+      - TZ=${TZ:-America/Chicago}
+    volumes:
+      - ${CONFIG_ROOT}/jellyseerr:/app/config
+    ports:
+      - 5055:5055
+    restart: unless-stopped
+
+  # --- Recommendarr (AI recommendations from your library; optional) ---
+  recommendarr:
+    container_name: recommendarr
+    image: tannermiddleton/recommendarr:latest
+    environment:
+      <<: *common-env
+      PORT: 3000
+      # Required so the server binds correctly and uses /app/server/data
+      DOCKER_ENV: "true"
+    # DOCKER_ENV=true makes the server proxy rewrite same-host service URLs
+    # (e.g. http://<host-ip>:8989) to host.docker.internal, which does not
+    # exist on Linux Docker unless mapped to the host gateway. Without this,
+    # every service connection test fails with ENOTFOUND.
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      # Recommendarr persists to /app/server/data, NOT /app/config. Mounting
+      # /app/config silently discards all configuration on redeploy.
+      - ${CONFIG_ROOT}/recommendarr:/app/server/data
+    ports:
+      - 3000:3000
+    restart: unless-stopped
+
+  # --- Jellystat (Jellyfin watch analytics; optional) ---
+  jellystat-db:
+    container_name: jellystat-db
+    image: postgres:15
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${JELLYSTAT_DB_PASSWORD}
+    volumes:
+      - ${CONFIG_ROOT}/jellystat-db:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  jellystat:
+    container_name: jellystat
+    image: cyfershepard/jellystat:latest
+    environment:
+      - TZ=${TZ:-America/Chicago}
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${JELLYSTAT_DB_PASSWORD}
+      - POSTGRES_IP=jellystat-db
+      - POSTGRES_PORT=5432
+      - JWT_SECRET=${JELLYSTAT_JWT_SECRET}
+    # host port 3001 because 3000 is taken by recommendarr
+    ports:
+      - 3001:3000
+    volumes:
+      - ${CONFIG_ROOT}/jellystat:/app/backend/backup-data
+    depends_on:
+      - jellystat-db
+    restart: unless-stopped
+
+  # --- Scrutiny (drive SMART health dashboard + alerting; optional) ---
+  scrutiny:
+    container_name: scrutiny
+    # Pinned: master-omnibus is a frozen tag; 0.9.x keys drives by a Scrutiny
+    # UUID instead of WWN and migrates sqlite+influx once on first start.
+    image: ghcr.io/analogj/scrutiny:v0.9.5-omnibus
+    cap_add:
+      - SYS_RAWIO
+    # List YOUR drives here (lsblk). Each must be passed through for SMART.
+    devices:
+      - /dev/sda
+      - /dev/sdb
+    volumes:
+      - ${CONFIG_ROOT}/scrutiny:/opt/scrutiny/config
+      - ${CONFIG_ROOT}/scrutiny-influxdb:/opt/scrutiny/influxdb
+      - /run/udev:/run/udev:ro
+    ports:
+      - 8085:8080
+    environment:
+      - TZ=${TZ:-America/Chicago}
+      # SMART poll 4x/day. Pick slots clear of your backup/parity jobs. Only
+      # applies on container (re)create.
+      - COLLECTOR_CRON_SCHEDULE=50 1,7,13,19 * * *
+    restart: unless-stopped
+
+  # --- Cloudflare Tunnel (expose Jellyfin/Jellyseerr off-LAN; optional) ---
+  # Create the tunnel in the Zero Trust dashboard, add public hostnames that
+  # point at http://jellyfin:8096 and http://jellyseerr:5055, and paste the
+  # tunnel token into .env. Delete this service if you only use the LAN or
+  # a VPN like Tailscale to get home.
+  cloudflared:
+    container_name: cloudflared
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+
+networks:
+  default:
+    driver: bridge
